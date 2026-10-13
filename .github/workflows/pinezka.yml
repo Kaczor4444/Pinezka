@@ -1,0 +1,90 @@
+name: Zolta Pinezka listener
+
+on:
+  schedule:
+    # GitHub cron is UTC and often starts 10-30 min late, so we start ~30 min before 13:50 PL.
+    # Summer (CEST, UTC+2, until 25 Oct 2026): 11:20 UTC = 13:20 PL  -> main run
+    #                                           12:20 UTC = 14:20 PL  -> backup (queued, exits if main ran)
+    # Winter (CET,  UTC+1, from 25 Oct 2026):   11:20 UTC = 12:20 PL  -> exits (too early)
+    #                                           12:20 UTC = 13:20 PL  -> main run
+    # The script itself checks Polish time, weekends and the contest end date.
+    - cron: "20 11 * * 1-5"
+    - cron: "20 12 * * 1-5"
+  workflow_dispatch:
+    inputs:
+      test_minutes:
+        description: "Test: listen NOW for N minutes (0 = normal run, waits for 13:50 PL)"
+        required: true
+        default: "5"
+      model:
+        description: "Whisper model (tiny / base / small)"
+        required: true
+        default: "small"
+
+# Only one listener at a time; the backup run waits in the queue instead of duplicating alerts.
+concurrency:
+  group: pinezka
+  cancel-in-progress: false
+
+jobs:
+  listen:
+    runs-on: ubuntu-latest
+    timeout-minutes: 300
+    env:
+      NTFY_TOPIC: ${{ secrets.NTFY_TOPIC }}
+      WHISPER_MODEL: ${{ github.event.inputs.model || 'small' }}
+      PYTHONUNBUFFERED: "1"
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Check secret
+        run: |
+          if [ -z "$NTFY_TOPIC" ]; then
+            echo "::error::Secret NTFY_TOPIC is missing (Settings > Secrets and variables > Actions)"
+            exit 1
+          fi
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Install ffmpeg
+        run: sudo apt-get update -qq && sudo apt-get install -y -qq ffmpeg
+
+      - name: Install Python packages
+        run: pip install -r requirements.txt
+
+      - name: Cache Whisper model
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/huggingface
+          key: whisper-${{ env.WHISPER_MODEL }}-v1
+
+      - name: Selftest (keyword detection)
+        run: python pinezka.py --selftest
+
+      - name: Listen
+        run: |
+          MIN="${{ github.event.inputs.test_minutes }}"
+          if [ -n "$MIN" ] && [ "$MIN" != "0" ]; then
+            python pinezka.py --test "$MIN"
+          else
+            python pinezka.py
+          fi
+
+      - name: Notify on failure
+        if: failure()
+        run: |
+          curl -s -H "Title: Pinezka: workflow FAILED" -H "Priority: 5" -H "Tags: warning" \
+            -d "Run failed - check GitHub Actions logs: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}" \
+            "https://ntfy.sh/$NTFY_TOPIC"
+
+      - name: Save transcript
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: transcript-${{ github.run_id }}
+          path: out/
+          if-no-files-found: ignore
+          retention-days: 14
