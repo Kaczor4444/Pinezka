@@ -77,6 +77,8 @@ FOLLOW_SEC = float(env("FOLLOW_SEC", "120"))   # keep sending transcript after a
 CLIP_BEFORE = 20
 CLIP_AFTER = 50
 HEARTBEAT_MIN = float(env("HEARTBEAT_MIN", "30"))
+META_ON = env("META", "1") == "1"                    # use ICY metadata (song / ad labels)
+META_WINDOW_SEC = float(env("META_WINDOW_SEC", "60"))  # +/- window: metadata vs audio offset
 
 PAGE_WATCH = env("PAGE_WATCH", "1") == "1"
 PAGE_URL = env("PAGE_URL", "https://www.rmf.fm/r/zolta-pinezka.html")
@@ -238,6 +240,89 @@ class StreamReader(threading.Thread):
             return bytes(self.buf[(start - self.buf_start) * 2:(end - self.buf_start) * 2])
 
 
+class MetaWatcher(threading.Thread):
+    """Reads ICY metadata (StreamTitle) on a separate connection.
+
+    Verified on 13 Oct 2026: RMF FM sends song titles ('Artist - Title'), 'Reklama',
+    'STOP_AD_BREAK' and 'RMF FM - FAKTY', updated live. Metadata and audio can be offset
+    by tens of seconds, so callers look at a window, not a single moment.
+    """
+
+    def __init__(self, urls: list[str]):
+        super().__init__(daemon=True)
+        self.urls = urls
+        self.lock = threading.Lock()
+        self.changes: list[tuple[dt.datetime, str]] = []   # (time, title)
+        self.stop = False
+
+    def run(self) -> None:
+        i = 0
+        while not self.stop:
+            url = self.urls[i % len(self.urls)]
+            i += 1
+            try:
+                req = urllib.request.Request(url, headers={"Icy-MetaData": "1",
+                                                           "User-Agent": "Mozilla/5.0"})
+                r = urllib.request.urlopen(req, timeout=20)
+                metaint = int(r.headers.get("icy-metaint", "0") or 0)
+                if not metaint:
+                    log(f"meta: no icy-metaint on {url}")
+                    time.sleep(30)
+                    continue
+                while not self.stop:
+                    r.read(metaint)
+                    n = r.read(1)
+                    if not n:
+                        break
+                    if n[0]:
+                        meta = r.read(n[0] * 16).rstrip(b"\0").decode("utf-8", "replace")
+                        m = re.search(r"StreamTitle='(.*?)';", meta)
+                        if m:
+                            self._add(m.group(1).strip())
+            except Exception as e:  # noqa: BLE001
+                log(f"meta: {e}")
+            time.sleep(5)
+
+    def _add(self, title: str) -> None:
+        with self.lock:
+            if not self.changes or self.changes[-1][1] != title:
+                self.changes.append((now_pl(), title))
+                log(f"meta: {title!r}")
+
+    def current(self) -> str:
+        with self.lock:
+            return self.changes[-1][1] if self.changes else ""
+
+    def titles_between(self, a: dt.datetime, b: dt.datetime) -> list[str]:
+        """All titles that were active at any point in [a, b]."""
+        with self.lock:
+            ch = list(self.changes)
+        out = [title for (t, title), nxt in zip(ch, ch[1:] + [(None, None)])
+               if t <= b and (nxt[0] is None or nxt[0] >= a)]
+        return out
+
+    def context(self, t: dt.datetime) -> tuple[str, bool]:
+        titles = self.titles_between(t - dt.timedelta(seconds=META_WINDOW_SEC),
+                                     t + dt.timedelta(seconds=META_WINDOW_SEC))
+        if not titles:
+            return "", False
+        label = " → ".join(titles[-3:])
+        return label, all(meta_kind(x) in ("ad", "song") for x in titles)
+
+
+def meta_kind(title: str) -> str:
+    low = normalize(title)
+    if not low:
+        return "unknown"
+    if low.startswith("reklama"):
+        return "ad"
+    if low.startswith("rmf fm") or "stop ad" in low:
+        return "station"          # FAKTY, idents, end of ad break -> hosts may talk
+    if " - " in title:
+        return "song"
+    return "unknown"
+
+
 def pcm_to_mp3(raw: bytes) -> tuple[bytes, str]:
     try:
         p = subprocess.run(["ffmpeg", "-hide_banner", "-loglevel", "error",
@@ -272,8 +357,11 @@ PASSWORD = re.compile(r"\bhas(l|el)\w*")   # haslo, hasla, hasle (hasło/hasła/
 class Detector:
     """Turns transcript chunks into notification decisions."""
 
-    def __init__(self, sender=notify):
+    def __init__(self, sender=notify, context=None):
         self.send = sender
+        # context(t) -> (label, quiet): what the stream metadata says was on air around t.
+        # quiet=True only when the WHOLE window around t was an ad or a song.
+        self.context = context or (lambda t: ("", False))
         self.history: collections.deque[tuple[dt.datetime, str]] = collections.deque(maxlen=4)
         self.signal_sent_at: dt.datetime | None = None
         self.weak_sent_at: dt.datetime | None = None
@@ -319,13 +407,21 @@ class Detector:
 
         # 3) password
         if PASSWORD.search(norm_now):
-            if self.pass_sent_at is None or (t - self.pass_sent_at).total_seconds() > 45:
-                self.send(f"{fmt_both(t)}:\n„{(prev[-300:] + ' ' + text).strip()}”",
-                          "HASŁO? - sprawdź!", 5, ["key"])
-                kinds.append("password")
-            self.pass_sent_at = t
-            self.follow_until = t + dt.timedelta(seconds=FOLLOW_SEC)
-            self.follow_kind = "hasło"
+            label, quiet = self.context(t)
+            note = f"\n(na antenie: {label})" if label else ""
+            if quiet:
+                # ad or song for the whole window: low-priority note, no clip, no follow-ups
+                self.send(f"{fmt_both(t)}:\n„{text}”{note}",
+                          "hasło w reklamie/piosence (raczej nie to)", 2, ["speech_balloon"])
+                kinds.append("password_low")
+            else:
+                if self.pass_sent_at is None or (t - self.pass_sent_at).total_seconds() > 45:
+                    self.send(f"{fmt_both(t)}:\n„{(prev[-300:] + ' ' + text).strip()}”{note}",
+                              "HASŁO? - sprawdź!", 5, ["key"])
+                    kinds.append("password")
+                self.pass_sent_at = t
+                self.follow_until = t + dt.timedelta(seconds=FOLLOW_SEC)
+                self.follow_kind = "hasło"
         self.events.extend(kinds)
         return kinds
 
@@ -368,6 +464,9 @@ def listen(until: dt.datetime, test: bool = False) -> None:
 
     reader = StreamReader(STREAM_URLS)
     reader.start()
+    meta = MetaWatcher(STREAM_URLS) if META_ON else None
+    if meta:
+        meta.start()
     if PAGE_WATCH and not test:
         threading.Thread(target=page_watch, args=(until,), daemon=True).start()
 
@@ -380,10 +479,13 @@ def listen(until: dt.datetime, test: bool = False) -> None:
             t0 = time.time()
         time.sleep(0.5)
 
-    notify(f"Słucham RMF FM ({reader.current_url}) do {fmt_both(until)}. Model: {MODEL}.",
+    time.sleep(3)
+    now_on = f" Teraz na antenie: {meta.current()}." if meta and meta.current() else ""
+    notify(f"Słucham RMF FM ({reader.current_url}) do {fmt_both(until)}. Model: {MODEL}.{now_on}",
            "Pinezka: nasłuch start" + (" (TEST)" if test else ""), 2, ["ear"])
 
-    det = Detector()
+    det = Detector(context=meta.context if meta else None)
+    last_meta = ""
     pos = reader.total
     chunk = int(CHUNK_SEC * SR)
     overlap = int(OVERLAP_SEC * SR)
@@ -422,6 +524,10 @@ def listen(until: dt.datetime, test: bool = False) -> None:
             text = " ".join(s.text.strip() for s in segs if s.no_speech_prob < 0.8).strip()
             took = time.time() - t1
             rtfs.append(took / (len(audio) / SR))
+            cur = meta.current() if meta else ""
+            if cur and cur != last_meta:
+                tr.write(f"[{now_pl():%H:%M:%S}] ### na antenie: {cur}\n")
+                last_meta = cur
             tr.write(f"[{chunk_time:%H:%M:%S}] {text}\n")
             tr.flush()
             log(f"({took:4.1f}s, lag {lag / SR:4.0f}s) {text}")
@@ -448,6 +554,8 @@ def listen(until: dt.datetime, test: bool = False) -> None:
             pos = end
 
     reader.stop = True
+    if meta:
+        meta.stop = True
     if reader.proc and reader.proc.poll() is None:
         reader.proc.kill()
     avg = sum(rtfs) / len(rtfs) if rtfs else 0
@@ -521,6 +629,30 @@ def selftest() -> None:
     got = d3.process(base, "O 14 startuje Żółta Pinezka, słuchajcie uważnie")
     print(("OK " if got == ["weak"] else "BAD"), "promo mention ->", got)
     ok &= got == ["weak"]
+    # metadata context: ad for the whole window -> quiet; hosts nearby -> loud
+    mw = MetaWatcher([])
+    t0 = base
+    mw.changes = [(t0, "Shanguy - La Louze"), (t0 + dt.timedelta(seconds=35), "Reklama"),
+                  (t0 + dt.timedelta(seconds=300), "STOP_AD_BREAK"),
+                  (t0 + dt.timedelta(seconds=400), "RMF FM - FAKTY")]
+    checks = [
+        (t0 + dt.timedelta(seconds=150), True),    # deep inside the ad break
+        (t0 + dt.timedelta(seconds=280), False),   # ad break ends within the window
+        (t0 + dt.timedelta(seconds=500), False),   # news / hosts
+        (t0 + dt.timedelta(seconds=10), True),     # song -> ad
+    ]
+    for when, exp_quiet in checks:
+        label, quiet = mw.context(when)
+        flag = "OK " if quiet == exp_quiet else "BAD"
+        ok &= quiet == exp_quiet
+        print(f"{flag} meta at +{(when - t0).seconds}s -> quiet={quiet} ({label})")
+    d4 = Detector(sender=lambda *a, **k: None, context=mw.context)
+    got = d4.process(t0 + dt.timedelta(seconds=150), "Hasło dnia: taniej w naszym sklepie!")
+    print(("OK " if got == ["password_low"] else "BAD"), "password in ad ->", got)
+    ok &= got == ["password_low"]
+    got = d4.process(t0 + dt.timedelta(seconds=500), "Dzisiejsze hasło brzmi: zielony parasol")
+    print(("OK " if got == ["password"] else "BAD"), "password from hosts ->", got)
+    ok &= got == ["password"]
     print("notifications:", sent)
     print("SELFTEST", "PASSED" if ok else "FAILED")
     sys.exit(0 if ok else 1)
