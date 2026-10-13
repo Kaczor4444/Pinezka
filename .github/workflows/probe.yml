@@ -1,0 +1,29 @@
+name: Probe muzyka-mowa
+
+on:
+  workflow_dispatch:
+    inputs:
+      seconds:
+        description: "Ile sekund nasluchiwac"
+        required: true
+        default: "240"
+
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    env:
+      NTFY_TOPIC: ${{ secrets.NTFY_TOPIC }}
+      PROBE_SECONDS: ${{ github.event.inputs.seconds }}
+      PYTHONUNBUFFERED: "1"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Install
+        run: |
+          sudo apt-get update -qq && sudo apt-get install -y -qq ffmpeg
+          pip install -q inaSpeechSegmenter faster-whisper
+      - name: Probe
+        run: python probe.py
